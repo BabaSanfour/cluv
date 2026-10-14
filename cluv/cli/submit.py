@@ -255,7 +255,7 @@ async def submit(
                 console.log("All job submissions have failed! Exiting.")
                 return None
 
-            for _cluster, cluster_jobs in cluster_to_job_submissions.items():
+            for cluster_jobs in cluster_to_job_submissions.values():
                 for job in cluster_jobs:
                     if job is not winning_job and not has_job(job) and job.state == "SYNCING":
                         job.state = "SKIPPED"
@@ -264,7 +264,7 @@ async def submit(
 
             jobs_to_cancel = [
                 job_submission
-                for _cluster, cluster_jobs in cluster_to_job_submissions.items()
+                for cluster_jobs in cluster_to_job_submissions.values()
                 for job_submission in cluster_jobs
                 if job_submission is not winning_job and has_job(job_submission)
             ]
@@ -557,39 +557,41 @@ async def get_submissions(
     cluster_config = config.get_cluster_config(cluster)
     job_resources_options = cluster_config.sbatch_args
 
-    if job_script is None:
-        if cluster_config.job_script_path is None:
-            raise ValueError(
-                f"No job script specified for cluster {cluster!r}, and no default job script "
-                f"path set in the config."
-            )
-        job_script = Path(os.path.expandvars(str(cluster_config.job_script_path)))
-    if not job_script.exists():
-        raise ValueError(
-            f"The job script ({job_script}) does not exist on this machine. Even though it "
-            f"can be customized per cluster, it needs to exist locally, since cluv needs to "
-            f"read its header to infer sbatch defaults."
-        )
-
+    # Get job vars
     job_env_vars = get_job_env_vars(
         cluster=cluster, git_commit=git_commit, cluster_config=cluster_config
     )
-    project_dir_on_cluster = cluster_config.project_dir
-    cluster_job_script_path = get_cluster_job_script_path(
-        local_job_script_path=job_script, cluster=cluster, cluster_config=cluster_config
+
+    # Get local job script
+    local_job_script_path = get_local_job_script(
+        job_script, cluster=cluster, cluster_config=cluster_config
     )
+
+    # Get the job script path on the remote cluster
+    cluster_job_script_path = get_cluster_job_script_path(
+        local_job_script_path=local_job_script_path, cluster=cluster, cluster_config=cluster_config
+    )
+
     for job_resources in job_resources_options:
         job_resources = merge_sbatch_args(from_config=job_resources, from_cli=sbatch_args)
         n_chunks, job_resources = apply_chunking(
-            job_resources, job_script=job_script, chunking=chunking, env_vars=job_env_vars
+            job_resources,
+            job_script=local_job_script_path,
+            chunking=chunking,
+            env_vars=job_env_vars,
         )
 
         for expanded_resources in await expand_for_vram(
-            cluster, remote, job_resources, job_script=job_script, vram=vram, env_vars=job_env_vars
+            cluster,
+            remote,
+            job_resources,
+            job_script=local_job_script_path,
+            vram=vram,
+            env_vars=job_env_vars,
         ):
             expanded_resources = add_cluv_sbatch_args(
                 expanded_resources,
-                job_script=job_script,
+                job_script=local_job_script_path,
                 cluster=cluster,
                 cluster_config=cluster_config,
             )
@@ -598,13 +600,13 @@ async def get_submissions(
                 job_script=cluster_job_script_path,
                 sbatch_args=expanded_resources,
                 program_args=program_args,
-                project_dir_on_cluster=project_dir_on_cluster,
+                project_dir_on_cluster=cluster_config.project_dir,
             )
             submissions.append(
                 Submission(
                     cluster=cluster,
                     remote=remote,
-                    job_script=job_script,
+                    job_script=local_job_script_path,
                     sbatch_args=expanded_resources,
                     program_args=program_args,
                     sbatch_command=sbatch_command,
@@ -615,10 +617,37 @@ async def get_submissions(
     return submissions
 
 
+def get_local_job_script(
+    job_script: Path | None, cluster: str, cluster_config: ClusterConfig
+) -> Path:
+    if job_script is None:
+        if cluster_config.job_script_path is None:
+            raise ValueError(
+                f"No job script specified for cluster {cluster!r}, and no default job script "
+                f"path set in the config."
+            )
+
+        job_script = Path(os.path.expandvars(str(cluster_config.job_script_path)))
+
+    if not job_script.exists():
+        raise ValueError(
+            f"The job script ({job_script}) does not exist on this machine. Even though it "
+            f"can be customized per cluster, it needs to exist locally, since cluv needs to "
+            f"read its header to infer sbatch defaults."
+        )
+
+    return job_script
+
+
 def get_cluster_job_script_path(
     local_job_script_path: Path, cluster: str, cluster_config: ClusterConfig
 ) -> PurePosixPath:
-    if cluster_config.job_script_path:
+    # Only when the script itself comes from the config (no script was passed to `cluv submit`)
+    # is the configured path used as-is on the cluster. One passed on the command line is
+    # resolved relative to the project dir below, like any other local script would be.
+    if cluster_config.job_script_path and local_job_script_path == Path(
+        os.path.expandvars(str(cluster_config.job_script_path))
+    ):
         return cluster_config.job_script_path
 
     local_project_dir = find_pyproject().parent
@@ -830,7 +859,7 @@ async def submit_job(submission: Submission, log_path: Path) -> Job:
             f"Failed to submit job on cluster {submission.cluster}: "
             f"{result.stderr or result.stdout}"
         )
-    write_submission_log(log_path, submission, job_id=job_id, error=error, result=result)
+    write_submission_log(log_path, job_id=job_id, error=error, result=result)
 
     if error is not None:
         raise JobSubmissionFailed(error)
@@ -866,7 +895,6 @@ def logging_commands_to(log_paths: tuple[Path, ...]):
 
 def write_submission_log(
     log_path: Path,
-    submission: Submission,
     *,
     job_id: int | None,
     error: str | None,

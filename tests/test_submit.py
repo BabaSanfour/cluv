@@ -26,6 +26,7 @@ from cluv.cli.submit import (
     ensure_clean_git_state,
     get_cluster_job_script_path,
     get_job_env_vars,
+    get_local_job_script,
     get_sbatch_command,
     get_submissions,
     logging_commands_to,
@@ -586,6 +587,146 @@ class TestGetSbatchCommand:
         )
         assert sbatch_command.count("--output=") == 1
         assert "--output=results/mila_%j/slurm-%j.out" in sbatch_command
+
+
+class TestJobScriptOverridesConfig:
+    """An explicitly passed job script must win over the `job_script_path` from the config.
+
+    The config setting only provides the default when `cluv submit` gets no script of its own;
+    it used to override the one passed on the command line, so e.g. `cluv submit mila
+    scripts/other_job.sh` would still run `scripts/job.sh`.
+    """
+
+    @staticmethod
+    def _config_with_job_script_defaults(project_dir: Path) -> None:
+        (project_dir / "pyproject.toml").write_text(
+            textwrap.dedent(
+                """\
+            [tool.cluv]
+            results_path = "results"
+            job_script_path = "scripts/config_job.sh"
+            [tool.cluv.clusters.mila]
+            [tool.cluv.clusters.rorqual]
+            job_script_path = "scripts/rorqual_job.sh"
+            """
+            )
+        )
+
+    async def test_passed_script_wins_over_global_config_default(self, project_dir: Path) -> None:
+        self._config_with_job_script_defaults(project_dir)
+        passed_script = project_dir / "scripts" / "passed_job.sh"
+        passed_script.parent.mkdir()
+        passed_script.touch(0o755)
+        (project_dir / "scripts" / "config_job.sh").touch(0o755)
+
+        submissions = await get_submissions(
+            cluster="mila",
+            remote=None,
+            job_script=passed_script,
+            sbatch_args=[],
+            program_args=[],
+            chunking=None,
+            git_commit="abcdef",
+        )
+        assert len(submissions) == 1
+        command = submissions[0].sbatch_command
+        assert "$HOME/my_project/scripts/passed_job.sh" in command
+        assert "config_job" not in command
+
+    async def test_passed_script_wins_over_per_cluster_config_default(
+        self, project_dir: Path
+    ) -> None:
+        self._config_with_job_script_defaults(project_dir)
+        passed_script = project_dir / "scripts" / "passed_job.sh"
+        passed_script.parent.mkdir()
+        passed_script.touch(0o755)
+        (project_dir / "scripts" / "rorqual_job.sh").touch(0o755)
+
+        submissions = await get_submissions(
+            cluster="rorqual",
+            remote=None,
+            job_script=passed_script,
+            sbatch_args=[],
+            program_args=[],
+            chunking=None,
+            git_commit="abcdef",
+        )
+        assert len(submissions) == 1
+        command = submissions[0].sbatch_command
+        assert "$HOME/my_project/scripts/passed_job.sh" in command
+        assert "rorqual_job" not in command
+
+    async def test_config_default_is_used_when_no_script_is_passed(
+        self, project_dir: Path
+    ) -> None:
+        self._config_with_job_script_defaults(project_dir)
+        (project_dir / "scripts").mkdir()
+        (project_dir / "scripts" / "rorqual_job.sh").touch(0o755)
+
+        submissions = await get_submissions(
+            cluster="rorqual",
+            remote=None,
+            job_script=None,
+            sbatch_args=[],
+            program_args=[],
+            chunking=None,
+            git_commit="abcdef",
+        )
+        assert len(submissions) == 1
+        # The configured path is used as-is on the cluster (here: relative to the project there).
+        assert "scripts/rorqual_job.sh" in submissions[0].sbatch_command
+        assert "my_project/scripts/rorqual_job.sh" not in submissions[0].sbatch_command
+
+
+class TestGetLocalJobScript:
+    @staticmethod
+    def _config(project_dir: Path, job_script_path: str | None = None):
+        default_line = f'job_script_path = "{job_script_path}"\n' if job_script_path else ""
+        (project_dir / "pyproject.toml").write_text(
+            f'[tool.cluv]\nresults_path = "results"\n{default_line}[tool.cluv.clusters.mila]\n'
+        )
+        return get_cluv_config().get_cluster_config("mila")
+
+    def test_passed_script_is_returned_as_is(self, project_dir: Path) -> None:
+        cluster_config = self._config(project_dir, job_script_path="scripts/config_job.sh")
+        passed_script = project_dir / "scripts" / "passed_job.sh"
+        passed_script.parent.mkdir()
+        passed_script.touch()
+
+        assert (
+            get_local_job_script(passed_script, cluster="mila", cluster_config=cluster_config)
+            == passed_script
+        )
+
+    def test_config_default_is_used_and_expanded_when_none_is_passed(
+        self, project_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MY_SCRIPTS", "scripts")
+        cluster_config = self._config(project_dir, job_script_path="$MY_SCRIPTS/job.sh")
+        (project_dir / "scripts").mkdir()
+        (project_dir / "scripts" / "job.sh").touch()
+
+        assert get_local_job_script(None, cluster="mila", cluster_config=cluster_config) == Path(
+            "scripts/job.sh"
+        )
+
+    def test_raises_when_no_script_is_passed_and_none_is_configured(
+        self, project_dir: Path
+    ) -> None:
+        cluster_config = self._config(project_dir)
+        with pytest.raises(ValueError, match="No job script specified for cluster 'mila'"):
+            get_local_job_script(None, cluster="mila", cluster_config=cluster_config)
+
+    def test_raises_when_passed_script_does_not_exist_locally(self, project_dir: Path) -> None:
+        cluster_config = self._config(project_dir)
+        missing_script = project_dir / "scripts" / "missing_job.sh"
+        with pytest.raises(ValueError, match="does not exist on this machine"):
+            get_local_job_script(missing_script, cluster="mila", cluster_config=cluster_config)
+
+    def test_raises_when_config_default_does_not_exist_locally(self, project_dir: Path) -> None:
+        cluster_config = self._config(project_dir, job_script_path="scripts/missing_job.sh")
+        with pytest.raises(ValueError, match="does not exist on this machine"):
+            get_local_job_script(None, cluster="mila", cluster_config=cluster_config)
 
 
 class TestSubmitCliParsing:
