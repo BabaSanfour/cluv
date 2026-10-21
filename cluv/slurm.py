@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -107,19 +108,17 @@ async def get_job_states_with_sacct(remote: Remote | None, jobs: list[int]) -> l
 def parse_sacct_job_states(output: str) -> dict[int, str]:
     """Parse `job_id|state` lines from sacct into one state per job.
 
-    A job array has one line per task (`1234_0`, `1234_[1-3]`). Its state is that of a running
-    task if there is one, else of a pending one, else of a failed one, else of any task.
+    A job array has one line per task (`1234_0`, `1234_[1-3]`). It is RUNNING or COMPLETED as soon
+    as one of its tasks is, else PENDING if one is pending, else the state of its first task.
     """
-    priority = ("RUNNING", "PENDING", *FAILED_JOB_STATES, "")
-    job_id_to_states: dict[int, list[str]] = {}
+    states_per_job: dict[int, list[str]] = defaultdict(list)
     for line in output.splitlines():
         job_id_str, _, state = line.partition("|")
-        job_id_to_states.setdefault(int(job_id_str.partition("_")[0]), []).append(state)
+        job_id = int(job_id_str.partition("_")[0])
+        states_per_job[job_id].append(state)
     return {
-        job_id: min(
-            states, key=lambda s: next(i for i, p in enumerate(priority) if s.startswith(p))
-        )
-        for job_id, states in job_id_to_states.items()
+        job_id: next((s for s in ("RUNNING", "COMPLETED", "PENDING") if s in states), states[0])
+        for job_id, states in states_per_job.items()
     }
 
 
