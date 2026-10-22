@@ -533,6 +533,34 @@ class TestGetSbatchCommand:
         )
         assert result.stdout.strip() == "GIT_COMMIT=abecdef MY_VAR=1"
 
+    @pytest.mark.parametrize(
+        "program_arg", ["", "two words", "it's"], ids=["empty", "space", "quote"]
+    )
+    def test_program_args_reach_sbatch_unchanged(self, program_arg: str) -> None:
+        """Program args must reach `sbatch` exactly as written after `--`.
+
+        The command goes through two shells on the cluster: the login shell that runs what `ssh`
+        was given, then the `bash -c` inside it. `shlex.split` splits it into words the same way,
+        once per shell. Quoting the inner command by hand
+        (`bash -c '... {shlex.join(program_args)}'`) used to silently drop an empty argument, and
+        split one containing a space, since `shlex.join`'s own quotes closed the outer ones.
+        """
+        program_args = ["Qwen/Qwen3.6-27B", program_arg, "impossible50"]
+        command = get_sbatch_command(
+            job_script=PurePosixPath("job.sh"),
+            sbatch_args={},
+            program_args=program_args,
+            env_vars={},
+        )
+        login_shell_words = shlex.split(command)
+        assert login_shell_words[:3] == ["bash", "--login", "-c"]
+        assert shlex.split(login_shell_words[3]) == [
+            "sbatch",
+            "--parsable",
+            "job.sh",
+            *program_args,
+        ]
+
     def test_caller_supplied_export_flag_is_replaced_by_cluvs_own(self, project_dir: Path) -> None:
         """A user-supplied `--export=...` is overwritten with cluv's `ALL`, not kept.
 
@@ -753,6 +781,17 @@ class TestSubmitCliParsing:
                 "parsable": False,
             }
         )
+
+    def test_empty_program_arg_is_kept(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty argument after `--` is a real argument for the job script."""
+        monkeypatch.setattr(
+            cluv_main, "submit", mock_submit := mock.AsyncMock(spec=cluv_main.submit)
+        )
+
+        program_args = ["Qwen/Qwen3.6-27B", "", "impossible50"]
+        cluv_main.main(["submit", "fir", "job.sh", "--", *program_args])
+
+        assert mock_submit.call_args.kwargs["program_args"] == program_args
 
     def test_sbatch_args_are_not_mistaken_for_job_script(
         self, monkeypatch: pytest.MonkeyPatch
